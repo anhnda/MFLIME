@@ -115,11 +115,24 @@ def fit_calibration(feature_net, preprocess, calib_glob, device, batch_size,
 
     centered = z - mu
     calib_d2 = np.einsum("ni,ij,nj->n", centered, precision, centered)
+
+    # Residual / reconstruction-error score (PCA-OOD): energy of a feature
+    # vector OUTSIDE the retained subspace. Masking artifacts tend to live in
+    # the discarded directions, so this is often a far stronger off-manifold
+    # signal than the in-subspace Mahalanobis distance.
+    #   recon = pca.inverse_transform(pca.transform(x))
+    #   residual = ||x - recon||^2
+    feat_mean = feats.mean(axis=0)
+    recon = pca.inverse_transform(z)
+    calib_resid = np.sum((feats - recon) ** 2, axis=1)
+
     return {
         "pca": pca,
         "mu": mu,
         "precision": precision,
         "calib_d2": np.sort(calib_d2),
+        "calib_resid": np.sort(calib_resid),
+        "feat_mean": feat_mean,
         "n_calib": n,
         "k": k,
         "evr": evr,
@@ -131,6 +144,43 @@ def features_to_d2(feats, calib):
     z = calib["pca"].transform(feats.astype(np.float64))
     centered = z - calib["mu"]
     return np.einsum("ni,ij,nj->n", centered, calib["precision"], centered)
+
+
+def features_to_resid(feats, calib):
+    """Reconstruction-error score: squared energy outside the PCA subspace."""
+    x = feats.astype(np.float64)
+    z = calib["pca"].transform(x)
+    recon = calib["pca"].inverse_transform(z)
+    return np.sum((x - recon) ** 2, axis=1)
+
+
+def features_to_score(feats, calib, score):
+    """Dispatch to the chosen off-manifold score."""
+    if score == "mahalanobis":
+        return features_to_d2(feats, calib)
+    elif score == "residual":
+        return features_to_resid(feats, calib)
+    elif score == "combo":
+        # Standardize each component by its calibration spread, then sum.
+        d2 = features_to_d2(feats, calib)
+        rs = features_to_resid(feats, calib)
+        d2n = d2 / max(np.median(calib["calib_d2"]), 1e-9)
+        rsn = rs / max(np.median(calib["calib_resid"]), 1e-9)
+        return d2n + rsn
+    raise ValueError(f"unknown score: {score}")
+
+
+def calib_scores(calib, score):
+    """Sorted calibration scores for the chosen metric (for threshold/CDF)."""
+    if score == "mahalanobis":
+        return calib["calib_d2"]
+    elif score == "residual":
+        return calib["calib_resid"]
+    elif score == "combo":
+        d2n = calib["calib_d2"] / max(np.median(calib["calib_d2"]), 1e-9)
+        rsn = calib["calib_resid"] / max(np.median(calib["calib_resid"]), 1e-9)
+        return np.sort(d2n + rsn)
+    raise ValueError(f"unknown score: {score}")
 
 
 # -----------------------------------------------------------------------------
@@ -207,9 +257,10 @@ def sigmoid_p_off(d2, thr, width):
 
 @torch.no_grad()
 def self_test(args, feature_net, preprocess, calib, device):
-    """Leave-one-out calibration distances + clean-input distance, so the user
-    can see whether the threshold actually separates before trusting it."""
-    print("\n[self-test] leave-one-out calibration distances")
+    """Calibration distances + clean-input distance, so the user can see whether
+    the threshold actually separates before trusting it. Reports BOTH metrics
+    (mahalanobis and residual) regardless of the active --score."""
+    print("\n[self-test] in-sample calibration scores (optimistic bound)")
     paths = sorted(glob.glob(args.calib_glob))
     feats = []
     batch = []
@@ -222,22 +273,25 @@ def self_test(args, feature_net, preprocess, calib, device):
         feats.append(feature_net(torch.stack(batch).to(device)).cpu().numpy())
     feats = np.concatenate(feats, axis=0)
 
-    # Re-project through the already-fit PCA/Gaussian (in-sample LOO proxy:
-    # these are the same points used to fit, so this is the optimistic bound).
     d2 = features_to_d2(feats, calib)
-    print(f"    calib d2: min={d2.min():.1f}  med={np.median(d2):.1f}  "
-          f"max={d2.max():.1f}  mean={d2.mean():.1f}")
+    rs = features_to_resid(feats, calib)
+    print(f"    calib mahalanobis: min={d2.min():.2f} med={np.median(d2):.2f} "
+          f"max={d2.max():.2f}")
+    print(f"    calib residual   : min={rs.min():.1f} med={np.median(rs):.1f} "
+          f"max={rs.max():.1f}")
 
-    # Clean (unperturbed) input distance.
+    # Clean (unperturbed) input under the active score.
     img = Image.open(args.input).convert("RGB").resize(
         (args.work_res, args.work_res), Image.BILINEAR)
     clean = feature_net(preprocess(img).unsqueeze(0).to(device)).cpu().numpy()
-    d2_clean = float(features_to_d2(clean, calib)[0])
-    thr = float(np.quantile(calib["calib_d2"], args.threshold_quantile))
-    print(f"    clean input d2 = {d2_clean:.1f}   threshold(q={args.threshold_quantile}) = {thr:.1f}")
-    if d2_clean >= thr:
-        print("    [WARN] clean input already exceeds threshold -> metric still "
-              "not separating; raise --pca-dim or check calibration set.")
+    s_clean = float(features_to_score(clean, calib, args.score)[0])
+    cs = calib_scores(calib, args.score)
+    thr = float(np.quantile(cs, args.threshold_quantile))
+    print(f"    [score={args.score}] clean input = {s_clean:.2f}   "
+          f"threshold(q={args.threshold_quantile}) = {thr:.2f}")
+    if s_clean >= thr:
+        print("    [WARN] clean input already exceeds threshold -> metric not "
+              "separating; lower --pca-dim or switch --score.")
     else:
         print("    [OK] clean input is inside the calibration distribution.")
     print(f"    PCA: k={calib['k']} comps, explained var ratio={calib['evr']:.3f}\n")
@@ -255,20 +309,22 @@ def run(args):
                             device, args.batch_size, args.pca_dim)
     print(f"    n_calib={calib['n_calib']}  pca_k={calib['k']}  "
           f"evr={calib['evr']:.3f}")
-    print(f"    calib d2 range=[{calib['calib_d2'][0]:.1f}, "
-          f"{calib['calib_d2'][-1]:.1f}]")
 
-    # Threshold from calibration quantile.
-    thr = float(np.quantile(calib["calib_d2"], args.threshold_quantile))
+    # Active off-manifold score and its calibration distribution.
+    cs = calib_scores(calib, args.score)
+    print(f"    [score={args.score}] calib range=[{cs[0]:.2f}, {cs[-1]:.2f}]")
+
+    # Threshold from calibration quantile of the ACTIVE score.
+    thr = float(np.quantile(cs, args.threshold_quantile))
     # Sigmoid width: default to the calibration IQR so the boundary is scaled
-    # to the spread of in-distribution distances.
+    # to the spread of in-distribution scores.
     if args.sigmoid_width > 0:
         width = args.sigmoid_width
     else:
-        q75, q25 = np.percentile(calib["calib_d2"], [75, 25])
-        width = max(q75 - q25, 1.0)
-    print(f"    threshold d2 (q={args.threshold_quantile}) = {thr:.1f}  "
-          f"sigmoid width = {width:.1f}")
+        q75, q25 = np.percentile(cs, [75, 25])
+        width = max(q75 - q25, 1e-6)
+    print(f"    threshold (q={args.threshold_quantile}) = {thr:.2f}  "
+          f"sigmoid width = {width:.2f}")
 
     if args.self_test:
         self_test(args, feature_net, preprocess, calib, device)
@@ -299,9 +355,9 @@ def run(args):
             return
         batch = torch.stack(buf_tensors).to(device)
         feats = feature_net(batch).cpu().numpy()
-        d2 = features_to_d2(feats, calib)
-        p_off = sigmoid_p_off(d2, thr, width)
-        for (idx, mode, filled, cmask), dd, pp in zip(buf_meta, d2, p_off):
+        sc = features_to_score(feats, calib, args.score)
+        p_off = sigmoid_p_off(sc, thr, width)
+        for (idx, mode, filled, cmask), dd, pp in zip(buf_meta, sc, p_off):
             if dd >= thr:
                 results.append((idx, float(pp), float(dd), mode, filled, cmask))
         buf_tensors.clear()
@@ -322,21 +378,21 @@ def run(args):
     # Sort off-manifold samples by probability, descending.
     results.sort(key=lambda r: r[1], reverse=True)
     print(f"[*] {len(results)} / {n} samples flagged off-manifold "
-          f"(d2 >= {thr:.1f})")
+          f"(score >= {thr:.2f})")
 
     # Save flagged samples.
     keep_top = results if args.max_save < 0 else results[:args.max_save]
-    for rank, (idx, p_off, d2, mode, filled, cmask) in enumerate(keep_top):
+    for rank, (idx, p_off, sc, mode, filled, cmask) in enumerate(keep_top):
         base = f"offman_{rank:04d}_p{p_off:.3f}_{mode}"
         Image.fromarray(filled).save(os.path.join(args.out_dir, base + ".png"))
         np.save(os.path.join(args.out_dir, base + "_mask.npy"), cmask)
     print(f"[*] saved {len(keep_top)} flagged images + masks to {args.out_dir}/")
 
-    # Manifest.
+    # Manifest. The score column name reflects the active --score.
     with open(os.path.join(args.out_dir, "manifest.csv"), "w") as f:
-        f.write("rank,sample_idx,p_off,mahalanobis_d2,fill_mode\n")
-        for rank, (idx, p_off, d2, mode, _, _) in enumerate(keep_top):
-            f.write(f"{rank},{idx},{p_off:.6f},{d2:.4f},{mode}\n")
+        f.write(f"rank,sample_idx,p_off,{args.score}_score,fill_mode\n")
+        for rank, (idx, p_off, sc, mode, _, _) in enumerate(keep_top):
+            f.write(f"{rank},{idx},{p_off:.6f},{sc:.4f},{mode}\n")
     print(f"[*] manifest written: {os.path.join(args.out_dir, 'manifest.csv')}")
 
 
@@ -351,6 +407,12 @@ def parse_args():
     ap.add_argument("--mask-prob", type=float, default=0.15,
                     help="Prob. a cell is masked-out (LIME-style). "
                          "0.5 saturates the filter; 0.10-0.20 is discriminative.")
+    ap.add_argument("--score", default="residual",
+                    choices=["mahalanobis", "residual", "combo"],
+                    help="Off-manifold score. 'residual' = PCA reconstruction "
+                         "error (energy outside subspace; best for masking "
+                         "artifacts). 'mahalanobis' = in-subspace distance. "
+                         "'combo' = normalized sum of both.")
     ap.add_argument("--pca-dim", type=int, default=64,
                     help="PCA target dim (clamped to n_calib-1). Lower = stricter "
                          "manifold; raise if clean input still flags off-manifold.")
