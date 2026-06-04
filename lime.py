@@ -493,7 +493,7 @@ def parse_args():
     ap.add_argument("--n-samples", type=int, default=1000,
                     help="Plain/no-full: perturbations evaluated. "
                          "--full: ON-manifold survivors required.")
-    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--batch-size", type=int, default=500)
     ap.add_argument("--mask-prob", type=float, default=0.5,
                     help="Prob. a cell is turned OFF. 0.5 = standard LIME; "
                          "0.10-0.20 if you want lighter perturbations for the "
