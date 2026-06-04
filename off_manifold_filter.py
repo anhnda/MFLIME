@@ -275,9 +275,19 @@ def apply_mask(img_u8, pix_mask, mode, variants):
 # Sampling + scoring.
 # -----------------------------------------------------------------------------
 def sigmoid_p_off(d2, thr, width):
-    """Map d2 -> (0,1) with a logistic centered at thr. `width` controls how
-    sharp the boundary is (in d2 units). p_off = 0.5 exactly at d2 == thr."""
-    return 1.0 / (1.0 + np.exp(-(d2 - thr) / max(width, 1e-9)))
+    """Map score -> (0,1) with a logistic centered at thr. `width` controls how
+    sharp the boundary is (in score units). p_off = 0.5 exactly at score == thr.
+
+    Numerically stable: computed branchwise so np.exp never sees a large
+    positive argument (which would overflow). Mathematically identical to
+    1/(1+exp(-z))."""
+    z = (np.asarray(d2, dtype=np.float64) - thr) / max(width, 1e-9)
+    out = np.empty_like(z)
+    pos = z >= 0
+    out[pos] = 1.0 / (1.0 + np.exp(-z[pos]))          # z>=0: exp(-z) in (0,1]
+    ez = np.exp(z[~pos])                               # z<0: exp(z) in (0,1)
+    out[~pos] = ez / (1.0 + ez)
+    return out
 
 
 @torch.no_grad()
