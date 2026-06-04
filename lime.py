@@ -351,8 +351,9 @@ def run(args):
         active_modes = args.filter_modes
         print(f"[*] filtering ON — fill modes: {', '.join(active_modes)}")
     else:
-        active_modes = ["blur"]
-        print(f"[*] filtering OFF — plain LIME, blur reference (sigma={args.sigma})")
+        #active_modes = ["blur"]
+        active_modes = [args.default_mask]
+        print(f"[*] filtering OFF — plain LIME, {args.default_mask} reference (sigma={args.sigma})")
 
     keep_Z, keep_y = [], []
     total_eval, total_surv = 0, 0
