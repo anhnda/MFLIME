@@ -14,22 +14,32 @@ Core LIME (standard implementation):
   Per-segment constants (the known LIME limitation) -> blocky map by design.
   Vectorized: cell-id gather on-device, closed-form weighted ridge.
 
-Optional survival filtering (three regimes, selected by flags):
+Optional survival filtering / weighting (four regimes, selected by flags):
 
   (A) --filter-modes NOT set
         Plain LIME. Evaluate exactly --n-samples perturbations, solve on all.
 
-  (B) --filter-modes set, --full NOT set
+  (B) --filter-modes set, --soft-manifold NOT set, --full NOT set
         Evaluate exactly --n-samples perturbations ONCE. Each is filled with a
         mode drawn from --filter-modes. From the single forward pass take BOTH
         the penultimate feature (-> off-manifold score) and the target prob
         (-> LIME target). Keep only ON-manifold survivors (score < threshold);
-        solve on those (<= n_samples).
+        solve on those (<= n_samples). HARD rejection.
 
-  (C) --filter-modes set, --full set
+  (C) --filter-modes set, --soft-manifold NOT set, --full set
         Same per-sample procedure, but keep batch-sampling / filtering /
         accumulating until survivors reach --n-samples (hard draw cap guards
-        against infinite loops).
+        against infinite loops). HARD rejection.
+
+  (D) --filter-modes set, --soft-manifold set
+        SOFT survival. Evaluate exactly --n-samples perturbations ONCE, keep
+        ALL of them (no rejection, no --full grind), but down-weight off-
+        manifold rows in the ridge. The manifold weight multiplies the LIME
+        cosine kernel weight. Two shapes:
+          step: w = 1 if on-manifold (score < thr) else --off-weight (e.g 0.1)
+          soft: w = sigmoid(-(score - thr)/tau)   (no threshold cliff)
+        'soft' escapes the quantile / pca-dim knife-edge that determines hard
+        survival counts; 'step' is the literal "1 in / 0.1 out" baseline.
 
 "Avoid rerun": the forward pass that yields the off-manifold score (penultimate
 feature) is the SAME pass that yields the LIME target (logits/probs). The model
@@ -37,8 +47,8 @@ never sees the same perturbation twice; survivors carry their target straight
 into the solver.
 
 The all-on anchor (Z=1, full sharp image) is always included in the regression;
-when filtering, it is retained unconditionally (it is the clean input, so
-on-manifold by definition).
+when filtering it is retained unconditionally and when soft-weighting it gets
+full weight 1.0 (it is the clean input, so on-manifold by definition).
 
 Standalone CLI version (no .base package): ResNet-50, --input image,
 --calib-glob default sample_1k/*.JPEG, --grid default 16.
@@ -209,6 +219,23 @@ def calib_scores(calib, score):
 
 
 # =============================================================================
+# Soft-manifold weight: maps an off-manifold score to a ridge weight in (0,1].
+#   step: w = 1 if score < thr else off_weight     (literal "1 in / 0.1 out")
+#   soft: w = sigmoid(-(score - thr)/tau)           (no threshold cliff)
+# =============================================================================
+def manifold_weight(sc, thr, mode, off_weight, tau):
+    """sc: (B,) off-manifold scores. Returns (B,) weight in (0,1]."""
+    sc = np.asarray(sc, dtype=np.float64)
+    if mode == "step":
+        w = np.where(sc < thr, 1.0, off_weight)
+    else:  # soft
+        t = tau if (tau is not None and tau > 0) else max(thr * 0.25, 1e-6)
+        # sigmoid(-(sc-thr)/t): 0.5 at sc==thr, ->1 well below, ->0 well above.
+        w = 1.0 / (1.0 + np.exp((sc - thr) / t))
+    return w.astype(np.float64)
+
+
+# =============================================================================
 # Fill modes (identical semantics to off_manifold_filter.py), tensor versions.
 # Each builds a [0,1] (1,3,H,W) "off" reference; per-sample modes (white_noise,
 # inpaint) are generated at fill time.
@@ -314,6 +341,7 @@ def run(args):
     feature_net, fc, mean, std = build_model(device)
 
     filtering = args.filter_modes is not None
+    soft = filtering and args.soft_manifold  # (D) soft survival regime
     grid = (args.grid, args.grid)
     n_cells = grid[0] * grid[1]
     gen = torch.Generator(device="cpu").manual_seed(args.seed)
@@ -349,41 +377,67 @@ def run(args):
         print(f"    [score={args.score}] on-manifold threshold "
               f"(q={args.threshold_quantile}) = {thr:.2f}")
         active_modes = args.filter_modes
-        print(f"[*] filtering ON — fill modes: {', '.join(active_modes)}")
+        if soft:
+            tau_disp = (args.weight_tau if (args.weight_tau is not None and
+                        args.weight_tau > 0) else max(thr * 0.25, 1e-6))
+            print(f"[*] SOFT-manifold ON — fill modes: "
+                  f"{', '.join(active_modes)} | weight={args.manifold_weight} "
+                  f"(off_weight={args.off_weight}, tau={tau_disp:.2f})")
+        else:
+            print(f"[*] HARD filtering ON — fill modes: "
+                  f"{', '.join(active_modes)}")
     else:
-        #active_modes = ["blur"]
         active_modes = [args.default_mask]
-        print(f"[*] filtering OFF — plain LIME, {args.default_mask} reference (sigma={args.sigma})")
+        print(f"[*] filtering OFF — plain LIME, {args.default_mask} reference "
+              f"(sigma={args.sigma})")
 
-    keep_Z, keep_y = [], []
+    keep_Z, keep_y, keep_w = [], [], []
     total_eval, total_surv = 0, 0
-    anchor_used = False
 
     def process_batch(zb_cpu, force_keep_anchor=False):
         """zb_cpu: (B,n_cells) on CPU. One forward pass; reuse for score+target.
-        force_keep_anchor: if True, row 0 is the all-on anchor and is retained
-        unconditionally (it IS the clean input -> on-manifold by definition)."""
+        force_keep_anchor: row 0 is the all-on anchor; in HARD mode retained
+        unconditionally, in SOFT mode given full weight 1.0 (clean input ->
+        on-manifold by definition)."""
         nonlocal total_eval, total_surv
         B = zb_cpu.shape[0]
         zb = zb_cpu.to(device)
         keep_pix = zb[:, cells].unsqueeze(1)  # (B,1,H,W)
 
-        mode = args.default_mask
-
         if filtering:
             mode = active_modes[int(torch.randint(len(active_modes), (1,),
-                                                   generator=gen).item())]
+                                                  generator=gen).item())]
+        else:
+            mode = args.default_mask
         comp = build_perturbations(x01, keep_pix, mode, variants, args.sigma,
                                    gen_gpu)
         feats, probs = forward_feats_probs(feature_net, fc, comp, mean, std)
         tgt = probs[:, target].cpu().numpy()
         total_eval += B
 
-        if not filtering:
+        # --- (D) SOFT: keep ALL rows, attach manifold weight ---------------
+        if soft:
+            sc = features_to_score(feats.cpu().numpy(), calib, args.score)
+            wman = manifold_weight(sc, thr, args.manifold_weight,
+                                   args.off_weight, args.weight_tau)
+            if force_keep_anchor:
+                wman[0] = 1.0  # clean input -> full weight
             for i in range(B):
-                keep_Z.append(zb_cpu[i].numpy()); keep_y.append(float(tgt[i]))
+                keep_Z.append(zb_cpu[i].numpy())
+                keep_y.append(float(tgt[i]))
+                keep_w.append(float(wman[i]))
+            total_surv += int((sc < thr).sum())  # reference count only
             return B
 
+        # --- (A) plain LIME: keep ALL rows, unit manifold weight -----------
+        if not filtering:
+            for i in range(B):
+                keep_Z.append(zb_cpu[i].numpy())
+                keep_y.append(float(tgt[i]))
+                keep_w.append(1.0)
+            return B
+
+        # --- (B)/(C) HARD filter: keep only survivors ----------------------
         sc = features_to_score(feats.cpu().numpy(), calib, args.score)
         survived = sc < thr
         if force_keep_anchor:
@@ -391,18 +445,28 @@ def run(args):
         s = 0
         for i in range(B):
             if survived[i]:
-                keep_Z.append(zb_cpu[i].numpy()); keep_y.append(float(tgt[i]))
+                keep_Z.append(zb_cpu[i].numpy())
+                keep_y.append(float(tgt[i]))
+                keep_w.append(1.0)
                 s += 1
         total_surv += s
         return s
 
-    if not filtering:
-        # (A) plain LIME, exactly n_samples (row 0 = anchor).
+    # -------------------------------------------------------------------------
+    # Dispatch. SOFT and plain both evaluate exactly n_samples once (no --full,
+    # no rejection). HARD uses (B) or (C).
+    # -------------------------------------------------------------------------
+    if soft or not filtering:
         Z = sample_Z(args.n_samples, n_cells, args.mask_prob, gen, anchor=True)
+        tag = "soft-manifold" if soft else "plain"
         print(f"[*] sampling {args.n_samples} perturbations "
-              f"(grid={grid[0]}x{grid[1]}) ...")
+              f"(grid={grid[0]}x{grid[1]}, {tag}) ...")
         for s in range(0, args.n_samples, args.batch_size):
-            process_batch(Z[s:s + args.batch_size])
+            process_batch(Z[s:s + args.batch_size], force_keep_anchor=(s == 0))
+        if soft:
+            print(f"[*] soft-manifold: kept all {len(keep_Z)} rows; "
+                  f"{total_surv}/{args.n_samples} would survive a hard thr "
+                  f"(reference only).")
 
     elif not args.full:
         # (B) filter the FIRST n_samples only.
@@ -410,8 +474,7 @@ def run(args):
         print(f"[*] sampling {args.n_samples}, keeping on-manifold survivors "
               f"(no --full) ...")
         for s in range(0, args.n_samples, args.batch_size):
-            first = (s == 0)
-            process_batch(Z[s:s + args.batch_size], force_keep_anchor=first)
+            process_batch(Z[s:s + args.batch_size], force_keep_anchor=(s == 0))
         print(f"[*] survivors: {total_surv} / {args.n_samples} on-manifold")
 
     else:
@@ -423,31 +486,45 @@ def run(args):
         first = True
         while total_surv < args.n_samples and total_eval < cap:
             b = min(args.batch_size, cap - total_eval)
-            # anchor only in the very first batch
             zb = sample_Z(b, n_cells, args.mask_prob, gen, anchor=first)
             process_batch(zb, force_keep_anchor=first)
             first = False
-            # print(f"    survivors {total_surv}/{args.n_samples} "
-            #       f"(evaluated {total_eval})")
+        surv_rate = total_surv / max(total_eval, 1)
+        print(f"[*] --full done: {total_surv} survivors / {total_eval} "
+              f"evaluated (survival rate {surv_rate:.3%}).")
+        if surv_rate < 0.01:
+            print(f"[WARN] survival rate {surv_rate:.3%} is very low — the "
+                  f"survivor set is small and biased toward light masks. "
+                  f"Consider --soft-manifold, a looser --threshold-quantile, "
+                  f"or lighter --mask-prob.")
         if total_surv < args.n_samples:
             print(f"[WARN] hit draw cap {cap} with {total_surv} survivors; "
                   f"solving on those.")
         if total_surv > args.n_samples:
             keep_Z[:] = keep_Z[:args.n_samples]
             keep_y[:] = keep_y[:args.n_samples]
+            keep_w[:] = keep_w[:args.n_samples]
 
     n_solve = len(keep_Z)
     if n_solve < 2:
         raise SystemExit(f"[FATAL] only {n_solve} perturbations to solve on. "
-                         f"Loosen --threshold-quantile, change --score, or "
-                         f"raise --n-samples / --max-draws.")
+                         f"Loosen --threshold-quantile, change --score, raise "
+                         f"--n-samples / --max-draws, or use --soft-manifold.")
 
     Znp = np.stack(keep_Z).astype(np.float64)
     y = np.asarray(keep_y, dtype=np.float64)
-    print(f"[*] solving weighted ridge on {n_solve} perturbations "
-          f"(evaluated {total_eval} total) ...")
 
+    # Final ridge weight = LIME cosine kernel * manifold weight (soft only).
     weights = lime_weights(Znp, args.kernel_width)
+    wman_arr = np.asarray(keep_w, dtype=np.float64)
+    if soft:
+        weights = weights * wman_arr
+
+    # Effective sample size of the weighted regression.
+    n_eff = float(weights.sum() ** 2 / (np.sum(weights ** 2) + 1e-12))
+    print(f"[*] solving weighted ridge on {n_solve} perturbations "
+          f"(evaluated {total_eval} total, n_eff={n_eff:.1f}) ...")
+
     coefs, intercept = weighted_ridge(Znp, y, weights, alpha=args.ridge_alpha)
 
     # Paint coefficients back to pixels.
@@ -471,14 +548,23 @@ def run(args):
     with open(os.path.join(args.out_dir, "summary.txt"), "w") as f:
         f.write(f"input: {args.input}\ntarget_class: {target}\n")
         f.write(f"grid: {grid[0]}x{grid[1]}\nfiltering: {filtering}\n")
+        f.write(f"soft_manifold: {soft}\n")
         if filtering:
             f.write(f"filter_modes: {args.filter_modes}\n")
             f.write(f"score: {args.score}  threshold_q: "
                     f"{args.threshold_quantile}  thr: {thr:.4f}\n")
-            f.write(f"full: {args.full}\n")
+            if soft:
+                f.write(f"manifold_weight: {args.manifold_weight}  "
+                        f"off_weight: {args.off_weight}  "
+                        f"weight_tau: {args.weight_tau}\n")
+            else:
+                f.write(f"full: {args.full}\n")
         f.write(f"n_samples_requested: {args.n_samples}\n")
         f.write(f"total_evaluated: {total_eval}\n")
         f.write(f"perturbations_in_solve: {n_solve}\n")
+        f.write(f"n_eff: {n_eff:.4f}\n")
+        if filtering:
+            f.write(f"would_survive_hard_thr: {total_surv}\n")
         f.write(f"ridge_intercept: {intercept:.6f}\n")
     print(f"[*] wrote attribution.npy, coefs.npy, heatmap.png, overlay.png, "
           f"summary.txt to {args.out_dir}/")
@@ -486,13 +572,14 @@ def run(args):
 
 def parse_args():
     ap = argparse.ArgumentParser(
-        description="Grid-LIME (ResNet-50) with optional off-manifold filtering.")
+        description="Grid-LIME (ResNet-50) with optional off-manifold "
+                    "filtering / soft weighting.")
     ap.add_argument("--input", required=True, help="Input image to explain.")
     ap.add_argument("--calib-glob", default="sample_1k/*.JPEG",
                     help="Calibration images (used only with --filter-modes).")
     ap.add_argument("--grid", type=int, default=16, help="Grid size (GxG).")
     ap.add_argument("--n-samples", type=int, default=1000,
-                    help="Plain/no-full: perturbations evaluated. "
+                    help="Plain/soft/no-full: perturbations evaluated. "
                          "--full: ON-manifold survivors required.")
     ap.add_argument("--batch-size", type=int, default=500)
     ap.add_argument("--mask-prob", type=float, default=0.5,
@@ -505,25 +592,46 @@ def parse_args():
                     help="LIME exponential-kernel width (cosine distance).")
     ap.add_argument("--ridge-alpha", type=float, default=1.0)
 
-    # Filtering.
+    # Filtering / weighting.
     ap.add_argument("--filter-modes", nargs="+", default=None,
                     choices=FILL_MODES, metavar="MODE",
                     help="Enable off-manifold survival filtering and choose the "
                          "fill mode(s). A perturbation survives if ON-manifold "
-                         "(score < threshold). If omitted: plain LIME (blur).")
-    ap.add_argument("--default-mask", default="blur", choices=FILL_MODES)
+                         "(score < threshold). If omitted: plain LIME.")
+    ap.add_argument("--default-mask", default="blur", choices=FILL_MODES,
+                    help="Fill mode for plain LIME (no --filter-modes).")
+
+    # Soft-manifold (D).
+    ap.add_argument("--soft-manifold", action="store_true",
+                    help="Soft survival: keep ALL perturbations, down-weight "
+                         "off-manifold ones instead of dropping. Requires "
+                         "--filter-modes for the score; ignores --full.")
+    ap.add_argument("--manifold-weight", default="soft",
+                    choices=["step", "soft"],
+                    help="step: w=1 if on-manifold else --off-weight. "
+                         "soft: w=sigmoid(-(score-thr)/tau), no threshold "
+                         "cliff (default).")
+    ap.add_argument("--off-weight", type=float, default=0.1,
+                    help="step mode: weight for off-manifold rows.")
+    ap.add_argument("--weight-tau", type=float, default=None,
+                    help="soft mode: sigmoid temperature. Default = thr*0.25.")
+
+    # Hard filtering (B/C).
     ap.add_argument("--full", action="store_true",
-                    help="With --filter-modes: keep sampling until --n-samples "
-                         "survivors collected (C). Else filter first "
-                         "--n-samples only (B).")
+                    help="With --filter-modes (HARD): keep sampling until "
+                         "--n-samples survivors collected (C). Else filter "
+                         "first --n-samples only (B). Ignored if "
+                         "--soft-manifold.")
     ap.add_argument("--max-draws", type=int, default=-1,
                     help="--full cap on total evaluated "
                          "(-1 => n_samples * --full-cap-factor).")
     ap.add_argument("--full-cap-factor", type=int, default=20)
+
     ap.add_argument("--score", default="residual",
                     choices=["mahalanobis", "residual", "combo"])
     ap.add_argument("--threshold-quantile", type=float, default=0.95,
-                    help="Calib-score quantile; perturbations BELOW it survive.")
+                    help="Calib-score quantile; perturbations BELOW it survive "
+                         "(HARD) or sit at the soft-weight midpoint (SOFT).")
     ap.add_argument("--pca-dim", type=int, default=64)
 
     ap.add_argument("--work-res", type=int, default=224)
