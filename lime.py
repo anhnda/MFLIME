@@ -367,11 +367,11 @@ def run(args):
         zb = zb_cpu.to(device)
         keep_pix = zb[:, cells].unsqueeze(1)  # (B,1,H,W)
 
+        mode = args.default_mask
+
         if filtering:
             mode = active_modes[int(torch.randint(len(active_modes), (1,),
                                                    generator=gen).item())]
-        else:
-            mode = "blur"
         comp = build_perturbations(x01, keep_pix, mode, variants, args.sigma,
                                    gen_gpu)
         feats, probs = forward_feats_probs(feature_net, fc, comp, mean, std)
@@ -426,8 +426,8 @@ def run(args):
             zb = sample_Z(b, n_cells, args.mask_prob, gen, anchor=first)
             process_batch(zb, force_keep_anchor=first)
             first = False
-            print(f"    survivors {total_surv}/{args.n_samples} "
-                  f"(evaluated {total_eval})")
+            # print(f"    survivors {total_surv}/{args.n_samples} "
+            #       f"(evaluated {total_eval})")
         if total_surv < args.n_samples:
             print(f"[WARN] hit draw cap {cap} with {total_surv} survivors; "
                   f"solving on those.")
@@ -510,6 +510,7 @@ def parse_args():
                     help="Enable off-manifold survival filtering and choose the "
                          "fill mode(s). A perturbation survives if ON-manifold "
                          "(score < threshold). If omitted: plain LIME (blur).")
+    ap.add_argument("--default-mask", default="blur", choices=FILL_MODES)
     ap.add_argument("--full", action="store_true",
                     help="With --filter-modes: keep sampling until --n-samples "
                          "survivors collected (C). Else filter first "
