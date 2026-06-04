@@ -468,19 +468,25 @@ def run(args):
     attr = coef_t[cells].cpu().numpy()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    np.save(os.path.join(args.out_dir, "attribution.npy"), attr)
-    np.save(os.path.join(args.out_dir, "coefs.npy"),
-            coefs.reshape(grid[0], grid[1]))
-    np.save(os.path.join(args.out_dir, "manifold_scores.npy"), active)
+    # Tag every artifact with fill mode + mask_prob so a fill/mask-prob sweep
+    # writing to one out-dir does not clobber itself. e.g. overlay__blur_mp0.80.png
+    tag = f"{fill}_mp{args.mask_prob:.2f}"
+
+    def op(name, ext):
+        return os.path.join(args.out_dir, f"{name}__{tag}.{ext}")
+
+    np.save(op("attribution", "npy"), attr)
+    np.save(op("coefs", "npy"), coefs.reshape(grid[0], grid[1]))
+    np.save(op("manifold_scores", "npy"), active)
 
     norm = (attr - attr.min()) / (np.ptp(attr) + 1e-12)
     heat_u8 = (255 * norm).astype(np.uint8)
-    Image.fromarray(heat_u8).save(os.path.join(args.out_dir, "heatmap.png"))
+    Image.fromarray(heat_u8).save(op("heatmap", "png"))
     cmap = cv2.cvtColor(cv2.applyColorMap(heat_u8, cv2.COLORMAP_JET),
                         cv2.COLOR_BGR2RGB)
     base_u8 = (x01[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
     overlay = (0.5 * base_u8 + 0.5 * cmap).astype(np.uint8)
-    Image.fromarray(overlay).save(os.path.join(args.out_dir, "overlay.png"))
+    Image.fromarray(overlay).save(op("overlay", "png"))
 
     # Score-distribution figure (diagnostic, not the map).
     try:
@@ -499,14 +505,14 @@ def run(args):
                      f"mean={mean_active:.2f}")
         ax.legend(fontsize=8)
         fig.tight_layout()
-        fig.savefig(os.path.join(args.out_dir, "score_hist.png"), dpi=120)
+        fig.savefig(op("score_hist", "png"), dpi=120)
         plt.close(fig)
         wrote_hist = True
     except Exception as e:
         wrote_hist = False
         print(f"[warn] score histogram skipped ({e})")
 
-    with open(os.path.join(args.out_dir, "summary.txt"), "w") as f:
+    with open(op("summary", "txt"), "w") as f:
         f.write(f"input: {args.input}\ntarget_class: {target}\n")
         f.write(f"grid: {grid[0]}x{grid[1]}\nfill: {fill}\n")
         f.write(f"mask_prob: {args.mask_prob}\n")
@@ -526,10 +532,11 @@ def run(args):
         f.write(f"LIMEScore.mean_mahalanobis: {mean_mahalanobis:.6f}\n")
         f.write(f"LIMEScore.mean_{args.score}: {mean_active:.6f}\n")
         f.write(f"LIMEScore.median_{args.score}: {median_active:.6f}\n")
-    outs = "attribution.npy, coefs.npy, manifold_scores.npy, heatmap.png, " \
-           "overlay.png, summary.txt"
+    outs = (f"attribution__{tag}.npy, coefs__{tag}.npy, "
+            f"manifold_scores__{tag}.npy, heatmap__{tag}.png, "
+            f"overlay__{tag}.png, summary__{tag}.txt")
     if wrote_hist:
-        outs += ", score_hist.png"
+        outs += f", score_hist__{tag}.png"
     print(f"[*] wrote {outs} to {args.out_dir}/")
 
 
