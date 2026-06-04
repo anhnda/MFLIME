@@ -467,6 +467,38 @@ def run(args):
     coef_t = torch.tensor(coefs, dtype=torch.float32, device=device)
     attr = coef_t[cells].cpu().numpy()
 
+    # ----- Insertion / deletion AUC of the FINAL attribution, averaged over
+    # multiple fill baselines (fill-agnostic faithfulness). Uses the SAME fill
+    # machinery as the explainer. This evaluates the map; it does not alter it.
+    avg_metrics = None
+    if not args.no_metrics:
+        from metrics import average_insertion_deletion, DEFAULT_FILLS
+        metric_fills = args.metric_fills if args.metric_fills else DEFAULT_FILLS
+        print(f"[*] evaluating insertion/deletion AUC over fills={metric_fills} "
+              f"(n_steps={args.metric_steps}) ...")
+        avg_metrics = average_insertion_deletion(
+            coefs.reshape(grid[0], grid[1]), x01, grid,
+            feature_net, fc, mean, std, target,
+            fills=metric_fills, variants=variants, sigma=args.sigma,
+            n_steps=args.metric_steps, batch_size=args.batch_size,
+            seed=args.seed)
+        print("")
+        print("=========== Faithfulness AUC (final attribution) ==============")
+        print(f"  fills averaged          : {avg_metrics['fills']}")
+        print(f"  avg_insertion (HIGHER better) : "
+              f"{avg_metrics['avg_insertion']:.4f}  "
+              f"(+/- {avg_metrics['std_insertion']:.4f})")
+        print(f"  avg_deletion  (LOWER better)  : "
+              f"{avg_metrics['avg_deletion']:.4f}  "
+              f"(+/- {avg_metrics['std_deletion']:.4f})")
+        print(f"  -- per fill --")
+        for f in avg_metrics["fills"]:
+            pf = avg_metrics["per_fill"][f]
+            print(f"    {f:<12} ins={pf['insertion_auc']:.4f}  "
+                  f"del={pf['deletion_auc']:.4f}")
+        print("===============================================================")
+        print("")
+
     os.makedirs(args.out_dir, exist_ok=True)
     # Tag every artifact with fill mode + mask_prob so a fill/mask-prob sweep
     # writing to one out-dir does not clobber itself. e.g. overlay__blur_mp0.80.png
@@ -532,6 +564,19 @@ def run(args):
         f.write(f"LIMEScore.mean_mahalanobis: {mean_mahalanobis:.6f}\n")
         f.write(f"LIMEScore.mean_{args.score}: {mean_active:.6f}\n")
         f.write(f"LIMEScore.median_{args.score}: {median_active:.6f}\n")
+        if avg_metrics is not None:
+            f.write("--- faithfulness AUC of final attribution "
+                    "(map evaluation, multi-fill avg) ---\n")
+            f.write(f"metric_fills: {avg_metrics['fills']}\n")
+            f.write(f"metric_steps: {args.metric_steps}\n")
+            f.write(f"avg_insertion_auc: {avg_metrics['avg_insertion']:.6f}\n")
+            f.write(f"std_insertion_auc: {avg_metrics['std_insertion']:.6f}\n")
+            f.write(f"avg_deletion_auc: {avg_metrics['avg_deletion']:.6f}\n")
+            f.write(f"std_deletion_auc: {avg_metrics['std_deletion']:.6f}\n")
+            for fn in avg_metrics["fills"]:
+                pf = avg_metrics["per_fill"][fn]
+                f.write(f"insertion_auc[{fn}]: {pf['insertion_auc']:.6f}\n")
+                f.write(f"deletion_auc[{fn}]: {pf['deletion_auc']:.6f}\n")
     outs = (f"attribution__{tag}.npy, coefs__{tag}.npy, "
             f"manifold_scores__{tag}.npy, heatmap__{tag}.png, "
             f"overlay__{tag}.png, summary__{tag}.txt")
@@ -578,6 +623,17 @@ def parse_args():
     ap.add_argument("--threshold-quantile", type=float, default=0.95,
                     help="Calib-score quantile defining the on-manifold thr "
                          "used for frac_on_manifold.")
+
+    # ---- Faithfulness-metric knobs (evaluation of the final map) ----
+    ap.add_argument("--no-metrics", action="store_true",
+                    help="Skip insertion/deletion AUC evaluation.")
+    ap.add_argument("--metric-fills", nargs="*", default=None,
+                    choices=FILL_MODES,
+                    help="Fill baselines to average insertion/deletion AUC "
+                         "over. Default: blur black white white_noise "
+                         "corner_mean.")
+    ap.add_argument("--metric-steps", type=int, default=50,
+                    help="Number of insertion/deletion curve steps.")
 
     # ---- Misc ----
     ap.add_argument("--batch-size", type=int, default=500)
