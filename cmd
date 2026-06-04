@@ -1,7 +1,5 @@
-python lime.py --input img/frenchh.JPEG --n-samples 2500 \
-  --filter-modes blur --soft-manifold --manifold-weight soft
-python lime.py --input img/frenchh.JPEG --n-sample 5000 --filter-modes white   --threshold-quantile 0.95 --pca-dim 64 --mask-prob 0.4
-python lime.py --input img/frenchh.JPEG --n-sample 5000 --default-mask white  --mask-prob 0.4
+python LIMEScore.py --input img/frenchh.JPEG --n-samples 2500 \
+  --default-mask blur --mask-prob 0.8
 
-python lime.py --input img/frenchh.JPEG --n-sample 5000 --filter-modes white   --threshold-quantile 0.95 --pca-dim 64 
-python lime.py --input img/frenchh.JPEG --n-sample 5000 --filter-modes inpaint   --threshold-quantile 0.95 --pca-dim 64 
+python LIMEScore.py --input img/frenchh.JPEG --n-samples 2500 \
+  --default-mask white_noise --mask-prob 0.8
