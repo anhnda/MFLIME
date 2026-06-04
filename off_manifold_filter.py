@@ -154,24 +154,49 @@ def features_to_resid(feats, calib):
     return np.sum((x - recon) ** 2, axis=1)
 
 
-def features_to_score(feats, calib, score):
-    """Dispatch to the chosen off-manifold score."""
+def features_to_score(feats, calib, score, baseline=None):
+    """Dispatch to the chosen off-manifold score.
+
+    For *_delta scores, `baseline` is the clean-input score of the same base
+    metric; the returned value is (score - baseline), i.e. how much each mask
+    moves the input off-manifold relative to its own starting point. This
+    cancels the input's intrinsic atypicality (where it sits in the calibration
+    distribution) and measures only the effect of masking."""
     if score == "mahalanobis":
         return features_to_d2(feats, calib)
     elif score == "residual":
         return features_to_resid(feats, calib)
     elif score == "combo":
-        # Standardize each component by its calibration spread, then sum.
         d2 = features_to_d2(feats, calib)
         rs = features_to_resid(feats, calib)
         d2n = d2 / max(np.median(calib["calib_d2"]), 1e-9)
         rsn = rs / max(np.median(calib["calib_resid"]), 1e-9)
         return d2n + rsn
+    elif score == "residual_delta":
+        if baseline is None:
+            raise ValueError("residual_delta requires baseline")
+        return features_to_resid(feats, calib) - baseline
+    elif score == "mahalanobis_delta":
+        if baseline is None:
+            raise ValueError("mahalanobis_delta requires baseline")
+        return features_to_d2(feats, calib) - baseline
     raise ValueError(f"unknown score: {score}")
 
 
+def base_metric(score):
+    """The underlying metric a (possibly delta) score is built on."""
+    return {"residual_delta": "residual",
+            "mahalanobis_delta": "mahalanobis"}.get(score, score)
+
+
+def is_delta(score):
+    return score.endswith("_delta")
+
+
 def calib_scores(calib, score):
-    """Sorted calibration scores for the chosen metric (for threshold/CDF)."""
+    """Sorted calibration scores for the chosen metric (for threshold/CDF).
+    Delta scores have no calibration analogue (calibration images have no
+    'clean baseline'), so their threshold is set separately in run()."""
     if score == "mahalanobis":
         return calib["calib_d2"]
     elif score == "residual":
@@ -180,7 +205,7 @@ def calib_scores(calib, score):
         d2n = calib["calib_d2"] / max(np.median(calib["calib_d2"]), 1e-9)
         rsn = calib["calib_resid"] / max(np.median(calib["calib_resid"]), 1e-9)
         return np.sort(d2n + rsn)
-    raise ValueError(f"unknown score: {score}")
+    raise ValueError(f"no calibration distribution for score: {score}")
 
 
 # -----------------------------------------------------------------------------
@@ -280,20 +305,37 @@ def self_test(args, feature_net, preprocess, calib, device):
     print(f"    calib residual   : min={rs.min():.1f} med={np.median(rs):.1f} "
           f"max={rs.max():.1f}")
 
-    # Clean (unperturbed) input under the active score.
+    # Clean (unperturbed) input.
     img = Image.open(args.input).convert("RGB").resize(
         (args.work_res, args.work_res), Image.BILINEAR)
     clean = feature_net(preprocess(img).unsqueeze(0).to(device)).cpu().numpy()
-    s_clean = float(features_to_score(clean, calib, args.score)[0])
-    cs = calib_scores(calib, args.score)
-    thr = float(np.quantile(cs, args.threshold_quantile))
-    print(f"    [score={args.score}] clean input = {s_clean:.2f}   "
-          f"threshold(q={args.threshold_quantile}) = {thr:.2f}")
-    if s_clean >= thr:
-        print("    [WARN] clean input already exceeds threshold -> metric not "
-              "separating; lower --pca-dim or switch --score.")
+
+    if is_delta(args.score):
+        # By definition the clean input's delta is 0 (it IS the baseline), so
+        # the only thing to report is whether the baseline sits in-distribution
+        # for the base metric, and what the delta threshold will be.
+        bm = base_metric(args.score)
+        b = float(features_to_score(clean, calib, bm)[0])
+        base_cs = calib_scores(calib, bm)
+        b_pct = 100.0 * np.searchsorted(base_cs, b) / len(base_cs)
+        b_q75, b_q25 = np.percentile(base_cs, [75, 25])
+        thr = args.delta_threshold * max(b_q75 - b_q25, 1e-6)
+        print(f"    [score={args.score}] clean baseline ({bm}) = {b:.2f} "
+              f"(calib pctile {b_pct:.0f}%)   delta threshold = {thr:.2f}")
+        print(f"    NOTE delta cancels baseline atypicality: a {b_pct:.0f}%-ile "
+              f"input is fine, only the mask's effect is measured.\n")
     else:
-        print("    [OK] clean input is inside the calibration distribution.")
+        s_clean = float(features_to_score(clean, calib, args.score)[0])
+        cs = calib_scores(calib, args.score)
+        thr = float(np.quantile(cs, args.threshold_quantile))
+        print(f"    [score={args.score}] clean input = {s_clean:.2f}   "
+              f"threshold(q={args.threshold_quantile}) = {thr:.2f}")
+        if s_clean >= thr:
+            print("    [WARN] clean input already exceeds threshold -> metric not "
+                  "separating; lower --pca-dim, switch --score, or use a "
+                  "*_delta score to cancel the input's baseline atypicality.")
+        else:
+            print("    [OK] clean input is inside the calibration distribution.")
     print(f"    PCA: k={calib['k']} comps, explained var ratio={calib['evr']:.3f}\n")
 
 
@@ -310,31 +352,49 @@ def run(args):
     print(f"    n_calib={calib['n_calib']}  pca_k={calib['k']}  "
           f"evr={calib['evr']:.3f}")
 
-    # Active off-manifold score and its calibration distribution.
-    cs = calib_scores(calib, args.score)
-    print(f"    [score={args.score}] calib range=[{cs[0]:.2f}, {cs[-1]:.2f}]")
-
-    # Threshold from calibration quantile of the ACTIVE score.
-    thr = float(np.quantile(cs, args.threshold_quantile))
-    # Sigmoid width: default to the calibration IQR so the boundary is scaled
-    # to the spread of in-distribution scores.
-    if args.sigmoid_width > 0:
-        width = args.sigmoid_width
-    else:
-        q75, q25 = np.percentile(cs, [75, 25])
-        width = max(q75 - q25, 1e-6)
-    print(f"    threshold (q={args.threshold_quantile}) = {thr:.2f}  "
-          f"sigmoid width = {width:.2f}")
-
-    if args.self_test:
-        self_test(args, feature_net, preprocess, calib, device)
-
     # Load input image at the model's working resolution so masks align cleanly.
     img = Image.open(args.input).convert("RGB")
     work_res = args.work_res
     img = img.resize((work_res, work_res), Image.BILINEAR)
     img_u8 = np.asarray(img, dtype=np.uint8)
     H, W = img_u8.shape[:2]
+
+    # Clean-input baseline (needed for delta scores; informative otherwise).
+    clean_feat = feature_net(
+        preprocess(Image.fromarray(img_u8)).unsqueeze(0).to(device)).cpu().numpy()
+    base_m = base_metric(args.score)
+    baseline = float(features_to_score(clean_feat, calib, base_m)[0])
+
+    if is_delta(args.score):
+        # Delta score = score(masked) - baseline. No calibration analogue, so
+        # the threshold is an ABSOLUTE margin above the clean input, scaled to
+        # the calibration spread of the base metric so it's comparable across
+        # inputs and pca-dims.
+        base_cs = calib_scores(calib, base_m)
+        b_q75, b_q25 = np.percentile(base_cs, [75, 25])
+        base_iqr = max(b_q75 - b_q25, 1e-6)
+        thr = args.delta_threshold * base_iqr  # delta units
+        width = args.sigmoid_width if args.sigmoid_width > 0 else base_iqr
+        print(f"    [score={args.score}] clean baseline ({base_m}) = "
+              f"{baseline:.2f}   base IQR = {base_iqr:.2f}")
+        print(f"    delta threshold = {thr:.2f} "
+              f"(= {args.delta_threshold} x base IQR)  sigmoid width = {width:.2f}")
+    else:
+        cs = calib_scores(calib, args.score)
+        print(f"    [score={args.score}] calib range=[{cs[0]:.2f}, {cs[-1]:.2f}]"
+              f"   clean baseline = {baseline:.2f}")
+        thr = float(np.quantile(cs, args.threshold_quantile))
+        if args.sigmoid_width > 0:
+            width = args.sigmoid_width
+        else:
+            q75, q25 = np.percentile(cs, [75, 25])
+            width = max(q75 - q25, 1e-6)
+        print(f"    threshold (q={args.threshold_quantile}) = {thr:.2f}  "
+              f"sigmoid width = {width:.2f}")
+
+    if args.self_test:
+        self_test(args, feature_net, preprocess, calib, device)
+
     variants = make_fill_variants(img_u8, blur_var=args.blur_var)
 
     rng = np.random.default_rng(args.seed)
@@ -347,7 +407,7 @@ def run(args):
     cell_masks = (rng.random((n, grid, grid)) > args.mask_prob).astype(np.uint8)
     modes = rng.choice(FILL_MODES, size=n)
 
-    results = []  # (idx, p_off, d2, mode, filled_u8, cell_mask)
+    results = []  # (idx, p_off, score, mode, filled_u8, cell_mask)
     buf_tensors, buf_meta = [], []
 
     def flush():
@@ -355,7 +415,7 @@ def run(args):
             return
         batch = torch.stack(buf_tensors).to(device)
         feats = feature_net(batch).cpu().numpy()
-        sc = features_to_score(feats, calib, args.score)
+        sc = features_to_score(feats, calib, args.score, baseline=baseline)
         p_off = sigmoid_p_off(sc, thr, width)
         for (idx, mode, filled, cmask), dd, pp in zip(buf_meta, sc, p_off):
             if dd >= thr:
@@ -399,7 +459,7 @@ def run(args):
 def parse_args():
     ap = argparse.ArgumentParser(description="Off-manifold mask filter (ResNet-50).")
     ap.add_argument("--input", required=True, help="Input image path.")
-    ap.add_argument("--calib-glob", default="sample_1k/*.JPEG",
+    ap.add_argument("--calib-glob", default="benchmark_50/*.JPEG",
                     help="Glob for calibration images.")
     ap.add_argument("--grid", type=int, default=16, help="Grid size (GxG).")
     ap.add_argument("--n-samples", type=int, default=1000)
@@ -408,11 +468,20 @@ def parse_args():
                     help="Prob. a cell is masked-out (LIME-style). "
                          "0.5 saturates the filter; 0.10-0.20 is discriminative.")
     ap.add_argument("--score", default="residual",
-                    choices=["mahalanobis", "residual", "combo"],
+                    choices=["mahalanobis", "residual", "combo",
+                             "residual_delta", "mahalanobis_delta"],
                     help="Off-manifold score. 'residual' = PCA reconstruction "
                          "error (energy outside subspace; best for masking "
                          "artifacts). 'mahalanobis' = in-subspace distance. "
-                         "'combo' = normalized sum of both.")
+                         "'combo' = normalized sum. '*_delta' = score relative "
+                         "to the clean input's baseline, which cancels the "
+                         "input's intrinsic atypicality and measures only the "
+                         "mask's effect (recommended for edge-of-manifold "
+                         "inputs / robust across pca-dim).")
+    ap.add_argument("--delta-threshold", type=float, default=1.0,
+                    help="For *_delta scores: threshold in units of the base "
+                         "metric's calibration IQR. A mask is off-manifold if it "
+                         "moves the input more than this many IQRs past clean.")
     ap.add_argument("--pca-dim", type=int, default=64,
                     help="PCA target dim (clamped to n_calib-1). Lower = stricter "
                          "manifold; raise if clean input still flags off-manifold.")
