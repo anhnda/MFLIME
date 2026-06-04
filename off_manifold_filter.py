@@ -5,23 +5,30 @@ off_manifold_filter.py
 Pipeline:
   1. Load ResNet-50 (ImageNet weights).
   2. From a calibration image folder, extract penultimate features (2048-d,
-     post-global-average-pool, pre-fc) and fit a Gaussian (mu, shrinkage-cov).
+     post-global-average-pool, pre-fc), PCA-reduce to a low-dim subspace the
+     n~50 calibration points can actually populate (default min(n-1, 64)),
+     then fit a Gaussian (mu, shrinkage-cov) IN THAT SUBSPACE.
   3. For a given input image, build a GRID x GRID grid, generate LIME-style
      random binary masks, fill the masked-out cells with one of several
      fill modes (blur / black / white / inpaint / corner-mean / white-noise).
-  4. Batch the masked images through the model, score each by Mahalanobis
-     distance in feature space, map to an off-manifold probability via the
-     empirical CDF of calibration distances.
+  4. Batch the masked images through the model, project to the PCA subspace,
+     score each by Mahalanobis distance, map to an off-manifold probability
+     via a sigmoid centered on the calibration threshold (so scores near the
+     boundary get intermediate p_off instead of snapping to 1.0).
   5. Output the masked samples that are flagged off-manifold (image + mask +
      p_off), saved to an output directory.
+
+  --self-test prints leave-one-out calibration distances and the clean-input
+  distance so you can see where the threshold actually sits before trusting it.
 
 Usage:
   python off_manifold_filter.py --input path/to/image.JPEG
   python off_manifold_filter.py --input img.JPEG --calib-glob "benchmark_50/*.JPEG" \
-         --grid 16 --n-samples 1000 --threshold-quantile 0.95 --batch-size 64
+         --grid 16 --n-samples 1000 --pca-dim 64 --mask-prob 0.15
+  python off_manifold_filter.py --input img.JPEG --self-test
 
 Requires: torch, torchvision, numpy, pillow, opencv-python (for inpaint),
-          scikit-learn (Ledoit-Wolf shrinkage).
+          scikit-learn (PCA + Ledoit-Wolf shrinkage).
 """
 
 import argparse
@@ -37,6 +44,7 @@ import torch.nn as nn
 import torchvision.models as models
 import torchvision.transforms as T
 from sklearn.covariance import LedoitWolf
+from sklearn.decomposition import PCA
 
 
 # -----------------------------------------------------------------------------
@@ -69,7 +77,8 @@ def extract_features(feature_net, batch, device):
 
 
 @torch.no_grad()
-def fit_calibration(feature_net, preprocess, calib_glob, device, batch_size):
+def fit_calibration(feature_net, preprocess, calib_glob, device, batch_size,
+                    pca_dim):
     paths = sorted(glob.glob(calib_glob))
     if not paths:
         raise FileNotFoundError(f"No calibration images matched: {calib_glob}")
@@ -85,33 +94,43 @@ def fit_calibration(feature_net, preprocess, calib_glob, device, batch_size):
     if batch:
         feats.append(extract_features(feature_net, torch.stack(batch), device))
 
-    feats = np.concatenate(feats, axis=0)  # (N, 2048)
-    mu = feats.mean(axis=0)
+    feats = np.concatenate(feats, axis=0).astype(np.float64)  # (N, 2048)
+    n = feats.shape[0]
 
-    # n (~50) << p (2048): empirical cov is rank-deficient. Use Ledoit-Wolf
-    # shrinkage so the precision matrix is well-conditioned.
-    lw = LedoitWolf().fit(feats - mu)
-    precision = lw.precision_.astype(np.float64)  # Sigma^-1
+    # n (~50) << p (2048): a Gaussian in raw 2048-d space is degenerate, so
+    # every perturbation lands "outside" all calibration points and p_off
+    # saturates at 1.0. Fix: PCA-reduce to a subspace the N points can populate
+    # (k <= N-1, since PCA on N centered points has at most N-1 nonzero comps).
+    k = min(pca_dim, n - 1)
+    if k < 1:
+        raise ValueError(f"Need >=2 calibration images for PCA, got n={n}.")
+    pca = PCA(n_components=k, whiten=False, svd_solver="full").fit(feats)
+    z = pca.transform(feats)  # (N, k)
+    evr = float(pca.explained_variance_ratio_.sum())
 
-    # Calibration distances -> empirical CDF for probability mapping & threshold.
-    centered = feats - mu
+    mu = z.mean(axis=0)
+    # Even at k<=N-1 the sample cov can be near-singular; shrink for stability.
+    lw = LedoitWolf().fit(z - mu)
+    precision = lw.precision_.astype(np.float64)  # Sigma^-1 in PCA space
+
+    centered = z - mu
     calib_d2 = np.einsum("ni,ij,nj->n", centered, precision, centered)
     return {
-        "mu": mu.astype(np.float64),
+        "pca": pca,
+        "mu": mu,
         "precision": precision,
         "calib_d2": np.sort(calib_d2),
-        "n_calib": len(paths),
+        "n_calib": n,
+        "k": k,
+        "evr": evr,
     }
 
 
-def mahalanobis_d2(feats, mu, precision):
-    centered = feats.astype(np.float64) - mu
-    return np.einsum("ni,ij,nj->n", centered, precision, centered)
-
-
-def p_off_from_cdf(d2, calib_d2_sorted):
-    # Empirical CDF: fraction of calibration distances below each query distance.
-    return np.searchsorted(calib_d2_sorted, d2, side="right") / len(calib_d2_sorted)
+def features_to_d2(feats, calib):
+    """Project raw 2048-d features to PCA space, return Mahalanobis d2."""
+    z = calib["pca"].transform(feats.astype(np.float64))
+    centered = z - calib["mu"]
+    return np.einsum("ni,ij,nj->n", centered, calib["precision"], centered)
 
 
 # -----------------------------------------------------------------------------
@@ -180,6 +199,50 @@ def apply_mask(img_u8, pix_mask, mode, variants):
 # -----------------------------------------------------------------------------
 # Sampling + scoring.
 # -----------------------------------------------------------------------------
+def sigmoid_p_off(d2, thr, width):
+    """Map d2 -> (0,1) with a logistic centered at thr. `width` controls how
+    sharp the boundary is (in d2 units). p_off = 0.5 exactly at d2 == thr."""
+    return 1.0 / (1.0 + np.exp(-(d2 - thr) / max(width, 1e-9)))
+
+
+@torch.no_grad()
+def self_test(args, feature_net, preprocess, calib, device):
+    """Leave-one-out calibration distances + clean-input distance, so the user
+    can see whether the threshold actually separates before trusting it."""
+    print("\n[self-test] leave-one-out calibration distances")
+    paths = sorted(glob.glob(args.calib_glob))
+    feats = []
+    batch = []
+    for p in paths:
+        batch.append(preprocess(Image.open(p).convert("RGB")))
+        if len(batch) == args.batch_size:
+            feats.append(feature_net(torch.stack(batch).to(device)).cpu().numpy())
+            batch = []
+    if batch:
+        feats.append(feature_net(torch.stack(batch).to(device)).cpu().numpy())
+    feats = np.concatenate(feats, axis=0)
+
+    # Re-project through the already-fit PCA/Gaussian (in-sample LOO proxy:
+    # these are the same points used to fit, so this is the optimistic bound).
+    d2 = features_to_d2(feats, calib)
+    print(f"    calib d2: min={d2.min():.1f}  med={np.median(d2):.1f}  "
+          f"max={d2.max():.1f}  mean={d2.mean():.1f}")
+
+    # Clean (unperturbed) input distance.
+    img = Image.open(args.input).convert("RGB").resize(
+        (args.work_res, args.work_res), Image.BILINEAR)
+    clean = feature_net(preprocess(img).unsqueeze(0).to(device)).cpu().numpy()
+    d2_clean = float(features_to_d2(clean, calib)[0])
+    thr = float(np.quantile(calib["calib_d2"], args.threshold_quantile))
+    print(f"    clean input d2 = {d2_clean:.1f}   threshold(q={args.threshold_quantile}) = {thr:.1f}")
+    if d2_clean >= thr:
+        print("    [WARN] clean input already exceeds threshold -> metric still "
+              "not separating; raise --pca-dim or check calibration set.")
+    else:
+        print("    [OK] clean input is inside the calibration distribution.")
+    print(f"    PCA: k={calib['k']} comps, explained var ratio={calib['evr']:.3f}\n")
+
+
 @torch.no_grad()
 def run(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -189,13 +252,26 @@ def run(args):
 
     print(f"[*] fitting calibration from {args.calib_glob} ...")
     calib = fit_calibration(feature_net, preprocess, args.calib_glob,
-                            device, args.batch_size)
-    print(f"    n_calib={calib['n_calib']}  "
-          f"calib d2 range=[{calib['calib_d2'][0]:.1f}, {calib['calib_d2'][-1]:.1f}]")
+                            device, args.batch_size, args.pca_dim)
+    print(f"    n_calib={calib['n_calib']}  pca_k={calib['k']}  "
+          f"evr={calib['evr']:.3f}")
+    print(f"    calib d2 range=[{calib['calib_d2'][0]:.1f}, "
+          f"{calib['calib_d2'][-1]:.1f}]")
 
     # Threshold from calibration quantile.
     thr = float(np.quantile(calib["calib_d2"], args.threshold_quantile))
-    print(f"    threshold d2 (q={args.threshold_quantile}) = {thr:.1f}")
+    # Sigmoid width: default to the calibration IQR so the boundary is scaled
+    # to the spread of in-distribution distances.
+    if args.sigmoid_width > 0:
+        width = args.sigmoid_width
+    else:
+        q75, q25 = np.percentile(calib["calib_d2"], [75, 25])
+        width = max(q75 - q25, 1.0)
+    print(f"    threshold d2 (q={args.threshold_quantile}) = {thr:.1f}  "
+          f"sigmoid width = {width:.1f}")
+
+    if args.self_test:
+        self_test(args, feature_net, preprocess, calib, device)
 
     # Load input image at the model's working resolution so masks align cleanly.
     img = Image.open(args.input).convert("RGB")
@@ -223,8 +299,8 @@ def run(args):
             return
         batch = torch.stack(buf_tensors).to(device)
         feats = feature_net(batch).cpu().numpy()
-        d2 = mahalanobis_d2(feats, calib["mu"], calib["precision"])
-        p_off = p_off_from_cdf(d2, calib["calib_d2"])
+        d2 = features_to_d2(feats, calib)
+        p_off = sigmoid_p_off(d2, thr, width)
         for (idx, mode, filled, cmask), dd, pp in zip(buf_meta, d2, p_off):
             if dd >= thr:
                 results.append((idx, float(pp), float(dd), mode, filled, cmask))
@@ -272,8 +348,14 @@ def parse_args():
     ap.add_argument("--grid", type=int, default=16, help="Grid size (GxG).")
     ap.add_argument("--n-samples", type=int, default=1000)
     ap.add_argument("--batch-size", type=int, default=64)
-    ap.add_argument("--mask-prob", type=float, default=0.5,
-                    help="Prob. a cell is masked-out (LIME-style).")
+    ap.add_argument("--mask-prob", type=float, default=0.15,
+                    help="Prob. a cell is masked-out (LIME-style). "
+                         "0.5 saturates the filter; 0.10-0.20 is discriminative.")
+    ap.add_argument("--pca-dim", type=int, default=64,
+                    help="PCA target dim (clamped to n_calib-1). Lower = stricter "
+                         "manifold; raise if clean input still flags off-manifold.")
+    ap.add_argument("--sigmoid-width", type=float, default=-1.0,
+                    help="Logistic width in d2 units for p_off. -1 = use calib IQR.")
     ap.add_argument("--blur-var", type=float, default=50.0,
                     help="Gaussian blur variance (sigma=sqrt(var)).")
     ap.add_argument("--threshold-quantile", type=float, default=0.95,
@@ -284,6 +366,8 @@ def parse_args():
     ap.add_argument("--max-save", type=int, default=-1,
                     help="Max flagged samples to save (-1 = all).")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--self-test", action="store_true",
+                    help="Print calib LOO distances + clean-input distance.")
     return ap.parse_args()
 
 
