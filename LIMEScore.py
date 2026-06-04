@@ -153,10 +153,23 @@ def fit_calibration(feature_net, mean, std, calib_glob, device, batch_size,
     centered = z - mu
     calib_d2 = np.einsum("ni,ij,nj->n", centered, precision, centered)
     recon = pca.inverse_transform(z)
-    calib_resid = np.sum((feats - recon) ** 2, axis=1)
+    diff2 = np.sum((feats - recon) ** 2, axis=1)
+    calib_resid = diff2
+    # Energy-normalized residual: fraction of feature energy OUTSIDE the
+    # subspace. Scale-free -> low-norm (black/white/const) fills can't win by
+    # shrinking. calib_resid_norm in [0,1).
+    fnorm2 = np.sum(feats ** 2, axis=1)
+    calib_resid_norm = diff2 / np.maximum(fnorm2, 1e-12)
+    # Angular residual: 1 - cos(f, recon). Also scale-free.
+    dot = np.sum(feats * recon, axis=1)
+    rnorm = np.sqrt(np.sum(recon ** 2, axis=1))
+    fnorm = np.sqrt(fnorm2)
+    calib_resid_ang = 1.0 - dot / np.maximum(fnorm * rnorm, 1e-12)
 
     return {"pca": pca, "mu": mu, "precision": precision,
             "calib_d2": np.sort(calib_d2), "calib_resid": np.sort(calib_resid),
+            "calib_resid_norm": np.sort(calib_resid_norm),
+            "calib_resid_ang": np.sort(calib_resid_ang),
             "n_calib": n, "k": k, "evr": evr}
 
 
@@ -173,11 +186,38 @@ def features_to_resid(feats, calib):
     return np.sum((x - recon) ** 2, axis=1)
 
 
+def features_to_resid_norm(feats, calib):
+    """Energy-normalized residual: ||f-recon||^2 / ||f||^2. Scale-free, so a
+    low-norm collapsed feature (black/white/const fill) cannot score low just
+    by shrinking -- numerator and denominator shrink together."""
+    x = feats.astype(np.float64)
+    z = calib["pca"].transform(x)
+    recon = calib["pca"].inverse_transform(z)
+    diff2 = np.sum((x - recon) ** 2, axis=1)
+    fnorm2 = np.sum(x ** 2, axis=1)
+    return diff2 / np.maximum(fnorm2, 1e-12)
+
+
+def features_to_resid_ang(feats, calib):
+    """Angular residual: 1 - cos(f, recon). Scale-free; pure direction."""
+    x = feats.astype(np.float64)
+    z = calib["pca"].transform(x)
+    recon = calib["pca"].inverse_transform(z)
+    dot = np.sum(x * recon, axis=1)
+    fnorm = np.sqrt(np.sum(x ** 2, axis=1))
+    rnorm = np.sqrt(np.sum(recon ** 2, axis=1))
+    return 1.0 - dot / np.maximum(fnorm * rnorm, 1e-12)
+
+
 def features_to_score(feats, calib, score):
     if score == "mahalanobis":
         return features_to_d2(feats, calib)
     if score == "residual":
         return features_to_resid(feats, calib)
+    if score == "residual_norm":
+        return features_to_resid_norm(feats, calib)
+    if score == "residual_ang":
+        return features_to_resid_ang(feats, calib)
     if score == "combo":
         d2 = features_to_d2(feats, calib)
         rs = features_to_resid(feats, calib)
@@ -192,6 +232,10 @@ def calib_scores(calib, score):
         return calib["calib_d2"]
     if score == "residual":
         return calib["calib_resid"]
+    if score == "residual_norm":
+        return calib["calib_resid_norm"]
+    if score == "residual_ang":
+        return calib["calib_resid_ang"]
     if score == "combo":
         d2n = calib["calib_d2"] / max(np.median(calib["calib_d2"]), 1e-9)
         rsn = calib["calib_resid"] / max(np.median(calib["calib_resid"]), 1e-9)
@@ -339,6 +383,7 @@ def run(args):
     keep_Z, keep_y = [], []
     # Accumulators for the on-manifold diagnostic (ALL perturbations).
     all_resid, all_d2, all_active = [], [], []
+    all_resid_norm, all_resid_ang = [], []
 
     def process_batch(zb_cpu, force_anchor=False):
         """One forward pass; reuse for BOTH the LIME target and the manifold
@@ -361,6 +406,8 @@ def run(args):
         # --- on-manifold diagnostic (parallel, never touches the map) -------
         all_resid.append(features_to_resid(feats_np, calib))
         all_d2.append(features_to_d2(feats_np, calib))
+        all_resid_norm.append(features_to_resid_norm(feats_np, calib))
+        all_resid_ang.append(features_to_resid_ang(feats_np, calib))
         all_active.append(features_to_score(feats_np, calib, args.score))
 
     # Standard LIME sampling: exactly n_samples, row 0 = all-on anchor.
@@ -378,12 +425,20 @@ def run(args):
     # ----- LIMEScore: aggregate on-manifold reliability over ALL masks ------
     resid = np.concatenate(all_resid)
     d2 = np.concatenate(all_d2)
+    resid_norm = np.concatenate(all_resid_norm)
+    resid_ang = np.concatenate(all_resid_ang)
     active = np.concatenate(all_active)
     n_all = active.shape[0]
 
-    frac_on_manifold = float(np.mean(active < thr))   # mean prob, HIGHER better
-    mean_residual = float(resid.mean())               # LOWER better
+    # frac_on_manifold == the old hard-filter "survival rate": fraction of
+    # masks with (active score < thr). It is computed on whichever --score is
+    # active, so switch --score to residual_norm / mahalanobis to get a survival
+    # rate that is NOT confounded by feature energy.
+    frac_on_manifold = float(np.mean(active < thr))   # == survival rate
+    mean_residual = float(resid.mean())               # LOWER better (confounded)
     mean_mahalanobis = float(d2.mean())               # LOWER better
+    mean_resid_norm = float(resid_norm.mean())        # LOWER better (de-confounded)
+    mean_resid_ang = float(resid_ang.mean())          # LOWER better (de-confounded)
     mean_active = float(active.mean())                # headline raw, LOWER better
     median_active = float(np.median(active))
 
@@ -392,14 +447,19 @@ def run(args):
     print(f"  fill mode               : {fill}")
     print(f"  mask_prob               : {args.mask_prob}")
     print(f"  perturbations scored     : {n_all}")
-    print(f"  -- probability score (HIGHER = more reliable) --")
+    print(f"  -- probability score / SURVIVAL RATE (HIGHER = more reliable) --")
     print(f"  frac_on_manifold         : {frac_on_manifold:.4f}   "
-          f"(mean prob score < thr)")
+          f"(= survival rate on '{args.score}', mean[score < thr])")
     print(f"  -- raw scores (LOWER = more reliable) --")
-    print(f"  mean_residual            : {mean_residual:.4f}")
+    print(f"  mean_residual            : {mean_residual:.4f}   "
+          f"(RAW resid — energy-confounded, do NOT use cross-fill)")
+    print(f"  mean_residual_norm       : {mean_resid_norm:.6f}   "
+          f"(||f-recon||^2/||f||^2 — scale-free)")
+    print(f"  mean_residual_ang        : {mean_resid_ang:.6f}   "
+          f"(1-cos(f,recon) — scale-free)")
     print(f"  mean_mahalanobis (d^2)   : {mean_mahalanobis:.4f}")
-    print(f"  mean_{args.score:<18}: {mean_active:.4f}   (headline raw)")
-    print(f"  median_{args.score:<16}: {median_active:.4f}")
+    print(f"  mean_{args.score:<18}: {mean_active:.6f}   (headline raw)")
+    print(f"  median_{args.score:<16}: {median_active:.6f}")
     print("===================================================================")
     print("")
 
@@ -461,6 +521,8 @@ def run(args):
                 f"{args.threshold_quantile}  thr: {thr:.6f}\n")
         f.write(f"LIMEScore.frac_on_manifold: {frac_on_manifold:.6f}\n")
         f.write(f"LIMEScore.mean_residual: {mean_residual:.6f}\n")
+        f.write(f"LIMEScore.mean_residual_norm: {mean_resid_norm:.6f}\n")
+        f.write(f"LIMEScore.mean_residual_ang: {mean_resid_ang:.6f}\n")
         f.write(f"LIMEScore.mean_mahalanobis: {mean_mahalanobis:.6f}\n")
         f.write(f"LIMEScore.mean_{args.score}: {mean_active:.6f}\n")
         f.write(f"LIMEScore.median_{args.score}: {median_active:.6f}\n")
@@ -499,8 +561,13 @@ def parse_args():
     ap.add_argument("--pca-dim", type=int, default=64,
                     help="PCA subspace dim for the manifold score.")
     ap.add_argument("--score", default="residual",
-                    choices=["mahalanobis", "residual", "combo"],
-                    help="Headline raw score; frac_on_manifold uses this too.")
+                    choices=["mahalanobis", "residual", "residual_norm",
+                             "residual_ang", "combo"],
+                    help="Headline raw score; frac_on_manifold (survival rate) "
+                         "uses this too. NOTE: raw 'residual' is energy-"
+                         "confounded and inverts across fills — use "
+                         "'residual_norm' or 'mahalanobis' for cross-fill "
+                         "comparison.")
     ap.add_argument("--threshold-quantile", type=float, default=0.95,
                     help="Calib-score quantile defining the on-manifold thr "
                          "used for frac_on_manifold.")
