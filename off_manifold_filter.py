@@ -23,7 +23,7 @@ Pipeline:
 
 Usage:
   python off_manifold_filter.py --input path/to/image.JPEG
-  python off_manifold_filter.py --input img.JPEG --calib-glob "benchmark_50/*.JPEG" \
+  python off_manifold_filter.py --input img.JPEG --calib-glob "sample_1k/*.JPEG" \
          --grid 16 --n-samples 1000 --pca-dim 64 --mask-prob 0.15
   python off_manifold_filter.py --input img.JPEG --self-test
 
@@ -361,6 +361,21 @@ def run(args):
                             device, args.batch_size, args.pca_dim)
     print(f"    n_calib={calib['n_calib']}  pca_k={calib['k']}  "
           f"evr={calib['evr']:.3f}")
+
+    # Guard: at the PCA rank ceiling (k == n_calib-1) the calibration set spans
+    # the whole subspace, so every calibration image reconstructs perfectly and
+    # the residual metric collapses to 0 (no discarded directions). Any residual
+    # threshold is then meaningless. Refuse early with an actionable message.
+    if base_metric(args.score) == "residual" and \
+            float(calib["calib_resid"][-1]) <= 1e-9:
+        raise SystemExit(
+            f"[FATAL] calibration residuals are all ~0 (pca_k={calib['k']} == "
+            f"n_calib-1={calib['n_calib']-1}, evr={calib['evr']:.3f}). The PCA "
+            f"subspace contains the entire calibration set, so the residual "
+            f"score has no discarded subspace to measure.\n"
+            f"  Fix: use more calibration images and/or a smaller --pca-dim so "
+            f"that pca_k << n_calib (e.g. --calib-glob \"sample_1k/*.JPEG\" "
+            f"--pca-dim 150). Current calib-glob: {args.calib_glob}")
 
     # Load input image at the model's working resolution so masks align cleanly.
     img = Image.open(args.input).convert("RGB")
