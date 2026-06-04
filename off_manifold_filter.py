@@ -399,7 +399,7 @@ def run(args):
 def parse_args():
     ap = argparse.ArgumentParser(description="Off-manifold mask filter (ResNet-50).")
     ap.add_argument("--input", required=True, help="Input image path.")
-    ap.add_argument("--calib-glob", default="benchmark_50/*.JPEG",
+    ap.add_argument("--calib-glob", default="sample_1k/*.JPEG",
                     help="Glob for calibration images.")
     ap.add_argument("--grid", type=int, default=16, help="Grid size (GxG).")
     ap.add_argument("--n-samples", type=int, default=1000)
