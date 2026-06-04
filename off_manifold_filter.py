@@ -427,10 +427,13 @@ def run(args):
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Generate samples: each = (cell_mask, fill_mode).
+    # Generate samples: each = (cell_mask, fill_mode). Fill modes are drawn
+    # from the active subset (args.fill_modes); default is all of them.
     n = args.n_samples
     cell_masks = (rng.random((n, grid, grid)) > args.mask_prob).astype(np.uint8)
-    modes = rng.choice(FILL_MODES, size=n)
+    active_modes = args.fill_modes
+    modes = rng.choice(active_modes, size=n)
+    print(f"[*] fill modes in use: {', '.join(active_modes)}")
 
     results = []  # (idx, p_off, score, mode, filled_u8, cell_mask)
     buf_tensors, buf_meta = [], []
@@ -487,6 +490,12 @@ def parse_args():
     ap.add_argument("--calib-glob", default="sample_1k/*.JPEG",
                     help="Glob for calibration images.")
     ap.add_argument("--grid", type=int, default=16, help="Grid size (GxG).")
+    ap.add_argument("--fill-modes", nargs="+", default=FILL_MODES,
+                    choices=FILL_MODES, metavar="MODE",
+                    help="Which fill mode(s) to sample. Default: all of them "
+                         f"({', '.join(FILL_MODES)}). Pass one (e.g. "
+                         "--fill-modes white_noise) to test a single mode, or "
+                         "several (e.g. --fill-modes black white white_noise).")
     ap.add_argument("--n-samples", type=int, default=1000)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--mask-prob", type=float, default=0.15,
