@@ -1,5 +1,5 @@
-# single mode
-python off_manifold_filter.py --input img/frenchh.JPEG --score residual_delta --fill-modes white_noise
+python lime.py --input img/frenchh.JPEG --n-sample 5000 --filter-modes white   --threshold-quantile 0.95 --pca-dim 64 --mask-prob 0.4
+python lime.py --input img/frenchh.JPEG --n-sample 5000 --default-mask white  --mask-prob 0.4
 
-# subset
-python off_manifold_filter.py --input img/frenchh.JPEG --score residual_delta --fill-modes black white white_noise
+python lime.py --input img/frenchh.JPEG --n-sample 5000 --filter-modes white   --threshold-quantile 0.95 --pca-dim 64 
+python lime.py --input img/frenchh.JPEG --n-sample 5000 --filter-modes inpaint   --threshold-quantile 0.95 --pca-dim 64 
