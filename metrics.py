@@ -53,7 +53,7 @@ from LIMEScore import (
 
 # Default fills to average over (inpaint excluded by default: per-mask cv2
 # inpaint is slow; include it explicitly if wanted).
-DEFAULT_FILLS: List[str] = ["blur", "black", "white", "white_noise",
+DEFAULT_FILLS: List[str] = ["blur", "black", "white",
                             "corner_mean"]
 
 
