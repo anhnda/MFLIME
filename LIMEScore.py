@@ -247,8 +247,8 @@ def calib_scores(calib, score):
 # Fill modes (tensor versions). Per-sample modes (white_noise, inpaint) built
 # at fill time; others precomputed.
 # =============================================================================
-FILL_MODES = ["blur", "black", "white", "inpaint", "corner_mean", "white_noise"]
-
+FILL_MODES = ["blur", "black", "white", "inpaint", "corner_mean",
+              "white_noise", "blend"]
 
 def make_fill_variants(x01, sigma):
     _, C, H, W = x01.shape
@@ -272,11 +272,17 @@ def make_fill_variants(x01, sigma):
     return v
 
 
-def build_perturbations(x01, keep_pix, mode, variants, sigma, gen):
+def build_perturbations(x01, keep_pix, mode, variants, sigma, gen,
+                        blend_alpha=0.5):
     """keep_pix: (B,1,H,W) in {0,1} (1=keep sharp). Returns (B,3,H,W) in [0,1]."""
     if mode == "white_noise":
         ref = torch.rand(keep_pix.shape[0], *x01.shape[1:], device=x01.device,
                          generator=gen)
+    elif mode == "blend":
+        # (1-a)*blur + a*white_noise. blur is shared; noise is per-sample.
+        noise = torch.rand(keep_pix.shape[0], *x01.shape[1:],
+                           device=x01.device, generator=gen)
+        ref = (1.0 - blend_alpha) * variants["blur"] + blend_alpha * noise
     elif mode == "inpaint":
         B = keep_pix.shape[0]
         base = (x01[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
@@ -291,7 +297,6 @@ def build_perturbations(x01, keep_pix, mode, variants, sigma, gen):
     else:
         ref = variants[mode]
     return keep_pix * x01 + (1 - keep_pix) * ref
-
 
 # =============================================================================
 # LIME core.
@@ -393,7 +398,7 @@ def run(args):
         zb = zb_cpu.to(device)
         keep_pix = zb[:, cells].unsqueeze(1)
         comp = build_perturbations(x01, keep_pix, fill, variants, args.sigma,
-                                   gen_gpu)
+                                   gen_gpu, blend_alpha=args.blend_alpha)
         feats, probs = forward_feats_probs(feature_net, fc, comp, mean, std)
         tgt = probs[:, target].cpu().numpy()
         feats_np = feats.cpu().numpy()
@@ -640,6 +645,10 @@ def parse_args():
     ap.add_argument("--work-res", type=int, default=224)
     ap.add_argument("--out-dir", default="limescore_out")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--blend-alpha", type=float, default=0.5,
+                help="For --default-mask blend: interpolation between blur "
+                     "(alpha=0, on-manifold) and white_noise (alpha=1, "
+                     "off-manifold). Sweep this to trace r continuously.")
     return ap.parse_args()
 
 
