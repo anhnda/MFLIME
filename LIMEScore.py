@@ -129,6 +129,20 @@ def forward_all(model, x01, mean, std):
     return model(normalize(x01, mean, std))
 
 
+@torch.no_grad()
+def forward_feats_probs(feature_net, fc, x01, mean, std):
+    """Backward-compat shim for metrics.py (penultimate-feature signature).
+
+    The mid-layer rewrite replaced this with forward_all, but metrics.py still
+    imports and calls forward_feats_probs(feature_net, fc, x01, mean, std) ->
+    (feats, probs), where feature_net is a Sequential ending in flatten and fc
+    is the classifier head. run()/sweep.py build exactly that pair from the
+    TappedResNet. This keeps the faithfulness-AUC path working unchanged."""
+    feats = feature_net(normalize(x01, mean, std))
+    probs = torch.softmax(fc(feats), dim=1)
+    return feats, probs
+
+
 # =============================================================================
 # Blur reference (unchanged).
 # =============================================================================
