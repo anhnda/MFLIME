@@ -273,6 +273,66 @@ def mid_to_resid_maps(mid_np, pca, score):
     return r[key].reshape(B, Ha, Wa)
 
 
+# =============================================================================
+# GPU projector. The per-batch residual was the bottleneck: it forced a full
+# GPU->CPU copy of the (B,1024,14,14) activation and ran sklearn PCA
+# (transform + inverse_transform, float64) on CPU, FOUR times per batch (once
+# for the active score, once each for the three reported variants). All three
+# variants derive from the SAME projection, so we compute it ONCE on GPU.
+#
+# sklearn PCA centers by mean_ before projecting; inverse_transform adds it
+# back. With orthonormal components V (k x C):
+#   xc = x - mean
+#   z  = xc @ V.T                      (projection coords, k-dim)
+#   recon = mean + z @ V
+#   ||xc - z@V||^2 = ||xc||^2 - ||z||^2   (V orthonormal)  -> raw residual
+# residual_norm and residual_ang in compute_cell_residuals normalize by the
+# UN-centered ||x||^2 and use cos(x, recon) in UN-centered space, so we keep x
+# (not xc) for those denominators to match the CPU numbers bit-for-bit.
+# =============================================================================
+def make_gpu_projector(calib, device, dtype=torch.float32):
+    """Returns a dict of GPU tensors for batched residual computation."""
+    pca = calib["pca"]
+    V = torch.as_tensor(pca.components_, dtype=dtype, device=device)   # (k, C)
+    mu = torch.as_tensor(pca.mean_, dtype=dtype, device=device)        # (C,)
+    return {"V": V, "mu": mu, "C": V.shape[1], "k": V.shape[0]}
+
+
+@torch.no_grad()
+def gpu_resid_maps(mid, proj, scores):
+    """mid: (B, C, Ha, Wa) torch tensor on GPU. `scores`: iterable subset of
+    {'residual','residual_norm','residual_ang'}. Returns dict score -> (B,Ha,Wa)
+    torch tensor on GPU. Computes the projection ONCE and derives all variants.
+
+    Matches compute_cell_residuals exactly (incl. its un-centered normalizers).
+    """
+    B, C, Ha, Wa = mid.shape
+    V, mu = proj["V"], proj["mu"]
+    x = mid.permute(0, 2, 3, 1).reshape(-1, C)        # (N, C), N = B*Ha*Wa
+    xc = x - mu                                       # centered
+    z = xc @ V.t()                                    # (N, k) projection coords
+    proj_e = (z * z).sum(dim=1)                       # ||projection||^2 (centered)
+    xc_e = (xc * xc).sum(dim=1)                        # ||xc||^2
+    diff2 = torch.clamp(xc_e - proj_e, min=0.0)        # raw residual (centered)
+    out = {}
+    if "residual" in scores:
+        out["residual"] = diff2.reshape(B, Ha, Wa)
+    if "residual_norm" in scores or "residual_ang" in scores:
+        fnorm2 = (x * x).sum(dim=1)                    # un-centered ||x||^2
+        if "residual_norm" in scores:
+            rn = diff2 / torch.clamp(fnorm2, min=1e-12)
+            out["residual_norm"] = rn.reshape(B, Ha, Wa)
+        if "residual_ang" in scores:
+            # recon = mu + z@V; cos(x, recon) in un-centered space.
+            recon = mu + z @ V                          # (N, C)
+            dot = (x * recon).sum(dim=1)
+            rnorm = torch.sqrt((recon * recon).sum(dim=1))
+            fnorm = torch.sqrt(fnorm2)
+            ang = 1.0 - dot / torch.clamp(fnorm * rnorm, min=1e-12)
+            out["residual_ang"] = ang.reshape(B, Ha, Wa)
+    return out
+
+
 def calib_dist(calib, score):
     return {"residual": calib["calib_resid"],
             "residual_norm": calib["calib_resid_norm"],

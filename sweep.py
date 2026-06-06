@@ -47,18 +47,20 @@ def _load_x01(path, work_res, device):
 
 
 @torch.no_grad()
-def score_one(model, mean, std, calib, overlap, x01, target, grid, fill,
-              alpha, mask_prob, args, device, gen_seed):
+def score_one(model, mean, std, calib, proj, overlap_t, x01, target, grid, Ha,
+              Wa, fill, alpha, mask_prob, args, device, gen_seed,
+              feature_net=None, fc=None):
     """Run the residual diagnostic (and optionally the LIME map + AUC) for one
     (image, fill, mask_prob, alpha). Returns a flat dict of metrics. Mirrors
-    LIMEScore.run but without any per-call model build or calibration fit."""
+    LIMEScore.run but without any per-call model build or calibration fit.
+
+    `proj` is a GPU projector (LIMEScore.make_gpu_projector); residuals are
+    computed on GPU once per batch. `overlap_t` is the grid->act overlap as a
+    GPU tensor. `Ha,Wa` are passed in (no extra clean forward pass)."""
     n_cells = grid[0] * grid[1]
     H = W = args.work_res
     cells = L.cell_id_map(H, W, grid, device)
     variants = L.make_fill_variants(x01, args.sigma)
-    # recover Ha,Wa from one pass
-    mid0, _, _ = L.forward_all(model, x01, mean, std)
-    Ha, Wa = mid0.shape[-2], mid0.shape[-1]
 
     cs = L.calib_dist(calib, args.score)
     thr = float(np.quantile(cs, args.threshold_quantile))
@@ -70,6 +72,10 @@ def score_one(model, mean, std, calib, overlap, x01, target, grid, fill,
     resid_kept_chunks, frac_kept_chunks = [], []
     resid_all_chunks, resid_norm_chunks, resid_ang_chunks = [], [], []
 
+    # We always need the active score (kept-restricted) plus all three for the
+    # ALL-cell report. Compute all three on GPU in one projection.
+    want = ("residual", "residual_norm", "residual_ang")
+
     Z = L.sample_Z(args.n_samples, n_cells, mask_prob, gen, anchor=True)
     for s in range(0, args.n_samples, args.batch_size):
         zb_cpu = Z[s:s + args.batch_size]
@@ -79,30 +85,31 @@ def score_one(model, mean, std, calib, overlap, x01, target, grid, fill,
                                      gen_gpu, blend_alpha=alpha)
         mid, _, probs = L.forward_all(model, comp, mean, std)
         tgt = probs[:, target].cpu().numpy()
-        mid_np = mid.cpu().numpy()
-        B = mid_np.shape[0]
+        B = mid.shape[0]
 
         for i in range(B):
             keep_Z.append(zb_cpu[i].numpy())
             keep_y.append(float(tgt[i]))
 
-        rmap = L.mid_to_resid_maps(mid_np, calib["pca"], args.score)
-        rflat = rmap.reshape(B, Ha * Wa)
+        # --- all residual variants in ONE GPU projection -------------------
+        rmaps = L.gpu_resid_maps(mid, proj, want)          # dict -> (B,Ha,Wa)
+        r_active = rmaps[args.score].reshape(B, Ha * Wa)   # GPU
         resid_all_chunks.append(
-            L.mid_to_resid_maps(mid_np, calib["pca"], "residual")
-            .reshape(B, -1).mean(axis=1))
+            rmaps["residual"].reshape(B, -1).mean(dim=1).cpu().numpy())
         resid_norm_chunks.append(
-            L.mid_to_resid_maps(mid_np, calib["pca"], "residual_norm")
-            .reshape(B, -1).mean(axis=1))
+            rmaps["residual_norm"].reshape(B, -1).mean(dim=1).cpu().numpy())
         resid_ang_chunks.append(
-            L.mid_to_resid_maps(mid_np, calib["pca"], "residual_ang")
-            .reshape(B, -1).mean(axis=1))
+            rmaps["residual_ang"].reshape(B, -1).mean(dim=1).cpu().numpy())
 
-        kept_frac = L.kept_fraction_per_act_cell(zb_cpu.numpy(), overlap)
-        wsum = np.maximum(kept_frac.sum(axis=1), 1e-12)
-        resid_kept_chunks.append((rflat * kept_frac).sum(axis=1) / wsum)
-        below = (rflat < thr).astype(np.float64)
-        frac_kept_chunks.append((below * kept_frac).sum(axis=1) / wsum)
+        # --- kept-restricted aggregate, on GPU -----------------------------
+        # kept_frac: (B, Ha*Wa) = zb (B, n_cells) @ overlap_t.T (n_cells,Ha*Wa)
+        kept_frac = zb.float() @ overlap_t.t()             # (B, Ha*Wa) GPU
+        wsum = torch.clamp(kept_frac.sum(dim=1), min=1e-12)
+        kept_resid = (r_active * kept_frac).sum(dim=1) / wsum
+        resid_kept_chunks.append(kept_resid.cpu().numpy())
+        below = (r_active < thr).float()
+        frac_kept = (below * kept_frac).sum(dim=1) / wsum
+        frac_kept_chunks.append(frac_kept.cpu().numpy())
 
     resid_kept = np.concatenate(resid_kept_chunks)
     frac_kept = np.concatenate(frac_kept_chunks)
@@ -121,17 +128,11 @@ def score_one(model, mean, std, calib, overlap, x01, target, grid, fill,
     }
 
     if not args.no_metrics:
-        import torch.nn as nn
         from metrics import average_insertion_deletion, DEFAULT_FILLS
         Znp = np.stack(keep_Z).astype(np.float64)
         yv = np.asarray(keep_y, dtype=np.float64)
         w = L.lime_weights(Znp, args.kernel_width)
         coefs, _ = L.weighted_ridge(Znp, yv, w, alpha=args.ridge_alpha)
-        feature_net = nn.Sequential(
-            model.stem, model.blocks["layer1"], model.blocks["layer2"],
-            model.blocks["layer3"], model.blocks["layer4"],
-            model.avgpool, model.flatten).eval().to(device)
-        fc = model.fc.eval().to(device)
         m = average_insertion_deletion(
             coefs.reshape(grid[0], grid[1]), x01, grid,
             feature_net, fc, mean, std, target,
@@ -223,6 +224,18 @@ def main():
     mid0, _, _ = L.forward_all(model, x0, mean, std)
     Ha, Wa = mid0.shape[-2], mid0.shape[-1]
     overlap = L.grid_to_act_overlap(grid, (Ha, Wa))
+    overlap_t = torch.as_tensor(overlap, dtype=torch.float32, device=device)
+    proj = L.make_gpu_projector(calib, device)
+
+    # Build the head/feature adapter ONCE (only needed for faithfulness AUC).
+    feature_net = fc = None
+    if not args.no_metrics:
+        import torch.nn as nn
+        feature_net = nn.Sequential(
+            model.stem, model.blocks["layer1"], model.blocks["layer2"],
+            model.blocks["layer3"], model.blocks["layer4"],
+            model.avgpool, model.flatten).eval().to(device)
+        fc = model.fc.eval().to(device)
 
     # Build the (fill, mask_prob, alpha) task list. alpha only varies for blend.
     tasks = []
@@ -264,8 +277,9 @@ def main():
                         + 100 * L.FILL_MODES.index(fill)
                         + int(round(mp * 10)) * 7
                         + int(round(a * 100)))
-            row = score_one(model, mean, std, calib, overlap, x01, target,
-                            grid, fill, a, mp, args, device, gen_seed)
+            row = score_one(model, mean, std, calib, proj, overlap_t, x01,
+                            target, grid, Ha, Wa, fill, a, mp, args, device,
+                            gen_seed, feature_net=feature_net, fc=fc)
             row["image"] = os.path.basename(img)
             row["fill"] = fill
             row["mask_prob"] = mp
